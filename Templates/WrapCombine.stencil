@@ -1,0 +1,177 @@
+{# 
+    This macro works around a Sourcery limitation and extract only the
+    generics where clause - if any - for the return type name.
+#}
+{% macro whereClauseFor method %}{#
+#}{% typed method as Method %}{#
+#}{% if method.returnTypeName.name|contains:"where" %}{#
+    #} where{#
+    #}{% for token in method.returnTypeName.name|split:"where" where token|contains:":" or token|contains:"==" %}{#
+        #}{{token}}{#
+    #}{% endfor %}{#
+#}{% else %}{#
+#}{% endif %}{#
+#}{% endmacro %}
+{# 
+    This macro generates a list of arguments (without brackets) needed
+    to invoke the wrapped method from within the Combine wrapper,
+    taking into account labels and "_"
+    
+    func test(a: Int, with b: Double, _ c: Float) 
+    will be invoked as follows:
+    test(a: a, with: b, c)
+#}
+{% macro callParamsForMethod method %}{#
+#}{% typed method as Method %}{#
+#}{% for arg in method.parameters %}{#
+    #}{% if arg.asSource|contains:"_ " %}{#
+        #}{{arg.name}}{#
+    #}{% else %}{#
+        #}{{arg.argumentLabel}}: {{arg.name}}{#
+    #}{% endif %}{#
+    #}{% if not forloop.last%}, {% endif %}{#
+#}{% endfor %}{#
+#}{% endmacro %}
+{# 
+    This macro generates an error type for the wrapped function,
+    to be used as `Failure` for the publisher being returned.
+    If no custom error is specified via the "wrapCombineErrorType" annotation, 
+    Failure will be set to "any Error".
+    If the method does not throw, the error type is set to "Never".
+#}
+{% macro errorForMethod method %}{#
+#}{% typed method as Method %}{#
+#}{% if method.throws %}{#
+    #}{{ method.annotations.wrapCombineErrorType if method|annotated:"wrapCombineErrorType" else 'any Error' }}{#
+#}{% else %}{#
+    #}Never{#
+#}{% endif %}{#
+#}{% endmacro %}
+{# 
+    This macro generates an (indented) catch block for the wrapped function,
+    in case it throws.
+#}
+{% macro catchBlockForError error isAsync %}{#
+#}{% typed error as String %}{#
+#}{% typed isAsync as Bool %}{#
+#}{% if error == "any Error" and isAsync %}{#
+                    #}catch {
+                        promise(.failure(error))  
+                    }
+{% elif error == "any Error" %}{#
+                #}catch {
+                    promise(.failure(error))  
+                }
+{% elif isAsync %}{#
+                    #}catch let error as {{error}} {
+                        promise(.failure(error))  
+                    } catch {
+                        fatalError("Unknown error type propagated: \(String(describing: type(of: error)))")
+                    }
+{% else %}{#
+                #}catch let error as {{error}} {
+                    promise(.failure(error))  
+                } catch {
+                    fatalError("Unknown error type propagated: \(String(describing: type(of: error)))")
+                }
+{% endif %}{#
+#}{% endmacro %}
+{# 
+    This macro generates a function that wraps an async throwing method.
+#}
+{% macro funcGenForAsyncThrowingMethod method %}
+{% typed method as Method %}
+{% set error %}{% call errorForMethod method %}{% endset %}
+    func {{method.name}} -> AnyPublisher<{{method.returnTypeName.unwrappedTypeName}}, {{ error }}>{% call whereClauseFor method %} {
+        Deferred {
+            Future { promise in
+                Task {
+                    do {
+                        let result: {{method.unwrappedReturnTypeName}} = try await {{method.callName}}({% call callParamsForMethod method %})
+                        promise(.success(result))
+                    } {% call catchBlockForError error method.isAsync %}
+                }
+            }
+        }
+        .eraseToAnyPublisher()
+    }
+{% endmacro %}
+{# 
+    This macro generates a function that wraps an async method.
+#}
+{% macro funcGenForAsyncMethod method %}
+{% typed method as Method %}
+    func {{method.name}} -> AnyPublisher<{{method.returnTypeName.unwrappedTypeName}}, {% call errorForMethod method %}>{% call whereClauseFor method %} {
+        Deferred {
+            Future { promise in
+                Task {
+                    let result: {{method.unwrappedReturnTypeName}} = await {{method.callName}}({% call callParamsForMethod method %})
+                    promise(.success(result))
+                }
+            }
+        }
+        .eraseToAnyPublisher()
+    }
+{% endmacro %}
+{# 
+    This macro generates a function that wraps a throwing method.
+#}
+{% macro funcGenForThrowingMethod method %}
+{% typed method as Method %}
+{% set error %}{% call errorForMethod method %}{% endset %}
+    func {{method.name}} -> AnyPublisher<{{method.returnTypeName.unwrappedTypeName}}, {{ error }}>{% call whereClauseFor method %} {
+        Deferred {
+            Future { promise in
+                do {
+                    let result: {{method.unwrappedReturnTypeName}} = try {{method.callName}}({% call callParamsForMethod method %})
+                    promise(.success(result))
+                } {% call catchBlockForError error method.isAsync %}
+            }
+        }
+        .eraseToAnyPublisher()
+    }
+{% endmacro %}
+{# 
+    This macro generates a function that wraps a method.
+#}
+{% macro funcGenForMethod method %}
+{% typed method as Method %}
+    func {{method.name}} -> AnyPublisher<{{method.returnTypeName.unwrappedTypeName}}, {% call errorForMethod method %}>{% call whereClauseFor method %} {
+        Deferred {
+            Future { promise in
+                let result: {{method.unwrappedReturnTypeName}} = {{method.callName}}({% call callParamsForMethod method %})
+                promise(.success(result))
+            }
+        }
+        .eraseToAnyPublisher()
+    }
+
+{% endmacro %}
+{# Beginning of code generation #}
+// swiftlint:disable all
+
+import Foundation
+import Combine
+
+{% for type in types.protocols|annotated:"wrapCombine" %}
+// MARK: - {{type.name}}
+
+extension {{type.name}} {
+
+{% for method in type.methods where not method.definedInType.isExtension %}
+    /// Combine wrapper for `{{method.shortName}}` method, auto-generated by Sourcery.
+    {% if method.isAsync and method.throws %}
+    {% call funcGenForAsyncThrowingMethod method %}
+    {% elif method.isAsync %}
+    {% call funcGenForAsyncMethod method %}
+    {% elif method.throws %}
+    {% call funcGenForThrowingMethod method %}
+    {% else %}
+    {% call funcGenForMethod method %}
+    {% endif %}
+
+{% endfor %}
+}
+
+{% endfor %}
+// swiftlint:enable all
